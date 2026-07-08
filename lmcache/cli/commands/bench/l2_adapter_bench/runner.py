@@ -20,7 +20,8 @@ import time
 
 # First Party
 from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.memory_management import MemoryObj
 
 # Local
@@ -36,6 +37,10 @@ LogFn = Callable[[str], None]
 KeyProvider = Callable[[int], list[list[ObjectKey]]]
 ObjProvider = Callable[[int], list[list[MemoryObj]]]
 
+# TODO: bench passes a placeholder layout_desc; a real layout may be
+# required here in the future (e.g. when benchmarking the P2P adapter).
+_PLACEHOLDER_LAYOUT_DESC = MemoryLayoutDesc(shapes=[], dtypes=[])
+
 
 def _bitmap_count(bitmap: Bitmap | None) -> int:
     """Count how many bits are set in *bitmap*. Returns 0 when None."""
@@ -46,10 +51,10 @@ def _bitmap_count(bitmap: Bitmap | None) -> int:
 
 def _wait_store_finished(
     adapter, task_ids: list[int], timeout: float
-) -> dict[int, bool]:
+) -> dict[int, L2StoreResult]:
     """Wait for all store tasks to finish.
 
-    Returns the accumulated ``{task_id: success}`` dict.
+    Returns the accumulated ``{task_id: L2StoreResult}`` dict.
     ``pop_completed_store_tasks`` consumes the adapter's completion
     dict, so we must accumulate the results here for the caller to
     use. On timeout, returns whatever was harvested so far (possibly
@@ -58,7 +63,7 @@ def _wait_store_finished(
     """
     unfinished = len(task_ids)
     efd = adapter.get_store_event_fd()
-    completed: dict[int, bool] = {}
+    completed: dict[int, L2StoreResult] = {}
     while unfinished > 0:
         if not wait_eventfd(efd, timeout=timeout):
             return completed
@@ -168,7 +173,7 @@ def bench_store(
         success_keys = sum(
             len(keys_batches[i])
             for i, tid in enumerate(task_ids)
-            if completed.get(tid, False)
+            if completed.get(tid, L2StoreResult(False, 0)).is_successful()
         )
 
         if timed_out:
@@ -216,6 +221,11 @@ def bench_lookup(
         expected_hit_count=expected_hit_count,
     )
 
+    log(
+        "bench_lookup uses a placeholder MemoryLayoutDesc; this may need a "
+        "real layout for layout-sensitive adapters"
+    )
+
     for r in range(rounds):
         keys_batches = keys_for_round(r)
         assert len(keys_batches) == in_flight
@@ -223,7 +233,11 @@ def bench_lookup(
         t0 = time.perf_counter()
         task_ids: list[int] = []
         for i in range(in_flight):
-            task_ids.append(adapter.submit_lookup_and_lock_task(keys_batches[i]))
+            task_ids.append(
+                adapter.submit_lookup_and_lock_task(
+                    keys_batches[i], _PLACEHOLDER_LAYOUT_DESC
+                )
+            )
 
         results = _wait_lookup_finished(adapter, task_ids, 60.0)
         t1 = time.perf_counter()
