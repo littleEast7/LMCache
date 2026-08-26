@@ -67,10 +67,10 @@ endpoint — this switches metrics to **push mode** (see
 Where ``/metrics`` lives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The pull-mode ``/metrics`` endpoint is served in one of two places depending
-on the entrypoint. Entrypoints that embed the uvicorn HTTP frontend serve it
-there (and disable the standalone Prometheus server); entrypoints with no
-HTTP frontend start the standalone server on ``--prometheus-port`` instead.
+The pull-mode ``/metrics`` endpoint location depends on the entrypoint.
+Entrypoints that embed a uvicorn HTTP frontend serve it there (and disable the
+standalone Prometheus server); entrypoints with no HTTP frontend start the
+standalone server on ``--prometheus-port`` instead.
 
 .. list-table::
    :header-rows: 1
@@ -82,6 +82,9 @@ HTTP frontend start the standalone server on ``--prometheus-port`` instead.
    * - ``lmcache server``
      - yes
      - ``--http-port`` (default ``8080``); ``--prometheus-port`` ignored
+   * - ``lmcache coordinator``
+     - yes
+     - ``--port`` (default ``9300``); no separate Prometheus port
    * - ``python -m lmcache.v1.multiprocess.server``
      - no
      - ``--prometheus-port`` (default ``9090``)
@@ -90,7 +93,8 @@ HTTP frontend start the standalone server on ``--prometheus-port`` instead.
      - ``--prometheus-port`` (default ``9090``)
 
 In **push mode** (``--otlp-endpoint`` set) none of these serve ``/metrics`` —
-metrics are pushed to the collector instead.
+metrics are pushed to the collector instead. The coordinator also returns 404
+from ``/metrics`` when started with ``--disable-metrics``.
 
 .. _mp-obs-grafana:
 
@@ -249,6 +253,15 @@ Configuration
      - ``0.01``
      - Fraction of chunks/blocks to track for lifecycle histograms
        (0, 1.0]. Counters always count all events. Default is 1%.
+   * - ``--enable-extra-logging``
+     - off
+     - Periodically log per-GPU L0<->L1 store/retrieve throughput and token
+       counts, plus L1 memory usage, at INFO level. Conflicts with
+       ``--disable-observability``. See :doc:`logs`.
+   * - ``--extra-logging-interval``
+     - ``10.0``
+     - Seconds between extra-logging emissions. Values below ``1.0`` are
+       limited by the 1 Hz internal heartbeat.
    * - ``--trace-level``
      - *(none)*
      - Enable trace recording at the given level. Currently only

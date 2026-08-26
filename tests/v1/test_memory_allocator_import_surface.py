@@ -32,43 +32,28 @@ def _run_import_script(script: str) -> None:
     )
 
 
-def test_memory_allocators_package_import_is_lazy() -> None:
-    """Importing the allocator package does not eagerly import submodules."""
+def test_memory_allocators_package_has_no_allocator_exports() -> None:
+    """Allocator classes are imported from their concrete submodules."""
     _run_import_script(
         """
         import sys
 
         import lmcache.v1.memory_allocators as allocators
 
-        allocator_modules = {
-            "ad_hoc_memory_allocator",
-            "buffer_allocator",
-            "cu_file_memory_allocator",
-            "devdax_memory_allocator",
-            "gpu_memory_allocator",
-            "hip_file_memory_allocator",
-            "host_memory_allocator",
-            "lazy_memory_allocator",
-            "mixed_memory_allocator",
-            "paged_cpu_gpu_memory_allocator",
-            "paged_tensor_memory_allocator",
-            "pin_memory_allocator",
-            "tensor_memory_allocator",
-        }
         loaded = sorted(
             name
             for name in sys.modules
             if name.startswith("lmcache.v1.memory_allocators.")
-            and name.rsplit(".", 1)[-1] in allocator_modules
         )
         assert loaded == [], loaded
-        assert "LazyMemoryAllocator" in allocators.__all__
-        assert "TensorMemoryAllocator" in allocators.__all__
+        assert not hasattr(allocators, "__all__")
+        assert not hasattr(allocators, "__getattr__")
+        assert not hasattr(allocators, "TensorMemoryAllocator")
         """
     )
 
 
-def test_allocator_submodule_first_import_preserves_old_surface() -> None:
+def test_allocator_submodule_first_import_keeps_core_surface() -> None:
     """Importing concrete allocator modules first does not create a cycle."""
     _run_import_script(
         """
@@ -80,86 +65,79 @@ def test_allocator_submodule_first_import_preserves_old_surface() -> None:
             TensorMemoryAllocator,
         )
         from lmcache.v1.memory_management import (
-            PagedAddressManager as OldPagedAddressManager,
-            PagedTensorMemoryAllocator as OldPagedTensorMemoryAllocator,
-            TensorMemoryAllocator as OldTensorMemoryAllocator,
+            MemoryAllocatorInterface,
+            MemoryFormat,
         )
 
-        assert PagedAddressManager is OldPagedAddressManager
-        assert PagedTensorMemoryAllocator is OldPagedTensorMemoryAllocator
-        assert TensorMemoryAllocator is OldTensorMemoryAllocator
+        assert PagedAddressManager.__name__ == "PagedAddressManager"
+        assert PagedTensorMemoryAllocator.__name__ == "PagedTensorMemoryAllocator"
+        assert TensorMemoryAllocator.__name__ == "TensorMemoryAllocator"
+        assert MemoryAllocatorInterface.__name__ == "MemoryAllocatorInterface"
+        assert MemoryFormat.KV_2LTD.name == "KV_2LTD"
         """
     )
 
 
-def test_allocator_package_first_import_preserves_old_surface() -> None:
-    """Package-level lazy exports match the old memory_management exports."""
+def test_multiple_allocator_submodule_imports_keep_core_surface() -> None:
+    """Concrete allocator imports do not disturb core memory_management imports."""
     _run_import_script(
         """
-        from lmcache.v1.memory_allocators import (
+        from lmcache.v1.memory_allocators.devdax_memory_allocator import (
             DevDaxMemoryAllocator,
+        )
+        from lmcache.v1.memory_allocators.tensor_memory_allocator import (
             TensorMemoryAllocator,
         )
         from lmcache.v1.memory_management import (
-            DevDaxMemoryAllocator as OldDevDaxMemoryAllocator,
-            TensorMemoryAllocator as OldTensorMemoryAllocator,
+            MemoryObj,
+            TensorMemoryObj,
         )
 
-        assert DevDaxMemoryAllocator is OldDevDaxMemoryAllocator
-        assert TensorMemoryAllocator is OldTensorMemoryAllocator
+        assert DevDaxMemoryAllocator.__name__ == "DevDaxMemoryAllocator"
+        assert TensorMemoryAllocator.__name__ == "TensorMemoryAllocator"
+        assert MemoryObj.__name__ == "MemoryObj"
+        assert TensorMemoryObj.__name__ == "TensorMemoryObj"
         """
     )
 
 
-def test_lazy_allocator_new_and_old_import_paths_match() -> None:
-    """The moved lazy allocator remains available from both import paths."""
-    _run_import_script(
-        """
-        from lmcache.v1.lazy_memory_allocator import (
-            LazyMemoryAllocator as OldLazyMemoryAllocator,
-        )
-        from lmcache.v1.memory_allocators import (
-            LazyMemoryAllocator as PackageLazyMemoryAllocator,
-        )
-        from lmcache.v1.memory_allocators.lazy_memory_allocator import (
-            LazyMemoryAllocator,
-        )
-
-        assert LazyMemoryAllocator is OldLazyMemoryAllocator
-        assert LazyMemoryAllocator is PackageLazyMemoryAllocator
-        """
-    )
-
-
-def test_memory_management_all_keeps_allocator_compatibility_names() -> None:
-    """The old memory_management import surface remains listed in __all__."""
+def test_memory_management_all_keeps_only_core_names() -> None:
+    """The memory_management import surface lists only core memory types."""
     _run_import_script(
         """
         import lmcache.v1.memory_management as memory_management
 
-        expected = {
+        allocator_names = {
             "AdHocMemoryAllocator",
-            "AddressManager",
             "BufferAllocator",
             "CuFileMemoryAllocator",
             "DevDaxMemoryAllocator",
             "GPUMemoryAllocator",
             "HipFileMemoryAllocator",
             "HostMemoryAllocator",
-            "MemoryAllocatorInterface",
-            "MemoryFormat",
-            "MemoryObj",
-            "MemoryObjMetadata",
             "MixedMemoryAllocator",
             "PagedAddressManager",
             "PagedCpuGpuMemoryAllocator",
             "PagedTensorMemoryAllocator",
             "PinMemoryAllocator",
             "TensorMemoryAllocator",
+        }
+        expected = {
+            "AddressManager",
+            "BytesBufferMemoryObj",
+            "FreeBlock",
+            "GDSMemoryObject",
+            "MemoryAllocatorInterface",
+            "MemoryFormat",
+            "MemoryObj",
+            "MemoryObjMetadata",
             "TensorMemoryObj",
+            "torch_device_type",
         }
         missing = expected - set(memory_management.__all__)
         assert missing == set(), missing
-        assert memory_management.PagedAddressManager.__name__ == "PagedAddressManager"
+        assert allocator_names.isdisjoint(memory_management.__all__)
+
+        assert not hasattr(memory_management, "TensorMemoryAllocator")
         """
     )

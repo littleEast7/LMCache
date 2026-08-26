@@ -66,12 +66,14 @@ from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
+    PagedTensorMemoryAllocator,
+)
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
-    MixedMemoryAllocator,
-    PagedTensorMemoryAllocator,
     _allocate_cpu_memory,
     _allocate_gpu_memory,
     _free_cpu_memory,
@@ -2078,7 +2080,17 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             future = asyncio.run_coroutine_threadsafe(
                 self.mem_to_storage(keys, memory_objs), self.loop
             )
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                with self.progress_lock:
+                    for key in keys:
+                        self.progress_set.discard(key)
+                logger.warning(
+                    f"NIXL batched put failed for {len(keys)} key(s); "
+                    f"skipping best-effort offload: {e}"
+                )
+                return
 
             # Call completion callback for sync mode
             if on_complete_callback is not None:
