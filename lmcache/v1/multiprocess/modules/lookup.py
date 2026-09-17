@@ -22,54 +22,11 @@ from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
-from lmcache.v1.multiprocess.engine_module import (
-    HandlerSpec,
-    ThreadPoolType,
-)
-from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.base import HandlerType, RequestType
+from lmcache.v1.multiprocess.request_handler import request_handler
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
-
-
-def compute_extra_count(
-    tp_size: int,
-    world_size: int,
-) -> int:
-    """Compute extra count for MLA multi-reader locking.
-
-    Non-MLA: each TP worker owns a distinct KV shard,
-      so each ObjectKey is retrieved by exactly 1
-      worker -> extra_count = 0.
-    MLA: TP does not split KV caches, all TP workers
-      share the same object. vLLM passes world_size
-      already divided by tp_size (e.g. world_size=1
-      for TP=4 PP=1), so ipc_keys_to_object_keys
-      only produces 1 ObjectKey per chunk.  All TP
-      workers retrieve that same ObjectKey, hence
-      extra_count = tp_size - 1.
-
-    Detection: tp > world_size means MLA (world_size
-    was divided by tp on the vLLM side).
-
-    Fallback: old vLLM (<= 0.8.5) does not send
-    tp_size (defaults to 1); we fall back to
-    world_size which gives extra_count = 0
-    (safe but may under-lock for MLA).
-
-    TODO: world_size currently carries an overloaded
-    meaning (total ranks for non-MLA vs total/tp for
-    MLA). Consider a dedicated field in the future.
-
-    Args:
-        tp_size: Tensor-parallel size from the client.
-        world_size: World size from the cache key.
-
-    Returns:
-        Number of extra count (0 for non-MLA).
-    """
-    tp = tp_size if tp_size > 1 else world_size
-    return tp - 1 if tp > world_size else 0
 
 
 def resolve_prefetched_obj_keys(
@@ -128,8 +85,8 @@ class _PrefetchJob:
     request_id: str
     # Number of tokens submitted for lookup (denominator for the L1+L2
     # token-level hit-rate metric).  Equals ``len(chunk_hashes) * chunk_size``
-    # on the happy path; 0 for early-exit paths (no GPU context matches
-    # or chunk_hashes is empty).  Consumed at ``MP_LOOKUP_PREFETCH_END``
+    # on the happy path; 0 on the early-exit paths (see
+    # ``early_exit_reason``).  Consumed at ``MP_LOOKUP_PREFETCH_END``
     # emission time in ``query_prefetch_status``.
     requested_tokens: int
     num_object_groups: int = 1
@@ -140,6 +97,9 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    # Names the ``lookup()`` branch that returned before submitting a prefetch
+    # task; empty on the normal path.
+    early_exit_reason: str = ""
 
 
 class LookupModule:
@@ -167,41 +127,6 @@ class LookupModule:
         """Return the shared engine context. Exposed for testing only."""
         return self._ctx
 
-    def get_handlers(self) -> list[HandlerSpec]:
-        """Return handler specs for all request types this module serves.
-
-        Returns:
-            List of handler specs for lookup-related request types.
-        """
-        return [
-            HandlerSpec(RequestType.LOOKUP, self.lookup, ThreadPoolType.NORMAL),
-            HandlerSpec(
-                RequestType.QUERY_PREFETCH_STATUS,
-                self.query_prefetch_status,
-                ThreadPoolType.NORMAL,
-            ),
-            HandlerSpec(
-                RequestType.WAIT_PREFETCH_STATUS,
-                self.wait_prefetch_status,
-                ThreadPoolType.NORMAL,
-            ),
-            HandlerSpec(
-                RequestType.QUERY_PREFETCH_LOOKUP_HITS,
-                self.query_prefetch_lookup_hits,
-                ThreadPoolType.NORMAL,
-            ),
-            HandlerSpec(
-                RequestType.FREE_LOOKUP_LOCKS,
-                self.free_lookup_locks,
-                ThreadPoolType.NORMAL,
-            ),
-            HandlerSpec(
-                RequestType.END_SESSION,
-                self.end_session,
-                ThreadPoolType.NORMAL,
-            ),
-        ]
-
     def report_status(self) -> dict[str, int]:
         """Return module-specific status information.
 
@@ -220,6 +145,7 @@ class LookupModule:
     # Handlers
     # -----------------------------------------------------------------
 
+    @request_handler(RequestType.LOOKUP, HandlerType.BLOCKING)
     def lookup(
         self,
         key: IPCCacheServerKey,
@@ -233,7 +159,7 @@ class LookupModule:
 
         Args:
             key: Cache key with request_id embedded.
-            tp_size: Tensor-parallel size for MLA multi-reader locking.
+            tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
@@ -271,11 +197,12 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    early_exit_reason="no_gpu_context",
                 )
             )
             return
 
-        extra_count = compute_extra_count(tp_size, world_size)
+        num_kv_readers = key.require_num_kv_readers()
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
@@ -294,6 +221,7 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    early_exit_reason="empty_chunk_hashes",
                 )
             )
             return
@@ -360,6 +288,7 @@ class LookupModule:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    early_exit_reason="no_group_layout_descs",
                 )
             )
             return
@@ -368,7 +297,7 @@ class LookupModule:
             PrefetchRequestSpec(
                 keys=obj_keys,
                 group_layout_descs=group_layout_descs,
-                extra_count=extra_count,
+                num_kv_readers=num_kv_readers,
                 attn_desc=attn_desc,
             ),
             external_request_id=key.request_id,
@@ -386,6 +315,7 @@ class LookupModule:
             )
         )
 
+    @request_handler(RequestType.QUERY_PREFETCH_LOOKUP_HITS, HandlerType.BLOCKING)
     def query_prefetch_lookup_hits(
         self,
         request_id: str,
@@ -413,6 +343,7 @@ class LookupModule:
         # Result is already in chunk-level units (l1_hit_chunks + l2_hit_chunks).
         return self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
 
+    @request_handler(RequestType.QUERY_PREFETCH_STATUS, HandlerType.BLOCKING)
     def query_prefetch_status(
         self,
         request_id: str,
@@ -464,6 +395,20 @@ class LookupModule:
             tuple(range(job.attn_desc.num_object_groups)),
         )
 
+        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
+        # object group's window rule, so L2's contribution is however much
+        # further ``found_count`` reaches -- not a count of L1-resident keys.
+        l1_chunks = job.handle.l1_hit_chunks
+        if l1_chunks > found_count:
+            logger.error(
+                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
+                l1_chunks,
+                found_count,
+                request_id,
+            )
+            l1_chunks = found_count
+        l2_chunks = found_count - l1_chunks
+
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_LOOKUP_PREFETCH_END,
@@ -472,6 +417,9 @@ class LookupModule:
                     "found_count": found_count,
                     "requested_tokens": job.requested_tokens,
                     "hit_tokens": found_count * self._ctx.chunk_size,
+                    "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
+                    "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
+                    "early_exit_reason": job.early_exit_reason,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,
                 },
@@ -483,6 +431,7 @@ class LookupModule:
 
         return found_count
 
+    @request_handler(RequestType.WAIT_PREFETCH_STATUS, HandlerType.BLOCKING)
     def wait_prefetch_status(
         self,
         request_id: str,
@@ -516,6 +465,7 @@ class LookupModule:
             return None
         return self.query_prefetch_status(request_id)
 
+    @request_handler(RequestType.FREE_LOOKUP_LOCKS, HandlerType.BLOCKING)
     def free_lookup_locks(
         self,
         key: IPCCacheServerKey,
@@ -530,14 +480,12 @@ class LookupModule:
 
         Only the keys the prefetch actually read-locked are released.
 
-        Computes the extra reader count from ``tp_size`` and
-        ``world_size`` the same way :meth:`lookup` does, so
-        the correct number of locks is released.
+        Releases the same per-object count the lookup reserved
+        (``key.num_kv_readers``).
 
         Args:
             key: Cache key whose read locks should be released.
-            tp_size: Tensor-parallel size for MLA
-                multi-reader locking.
+            tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         if key.start >= key.end:
             return
@@ -563,12 +511,11 @@ class LookupModule:
         if not obj_keys:
             return
 
-        extra_count = compute_extra_count(tp_size, key.world_size)
-
         self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys, extra_count=extra_count
+            obj_keys, read_locks=key.require_num_kv_readers()
         )
 
+    @request_handler(RequestType.END_SESSION, HandlerType.BLOCKING)
     def end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.
 
